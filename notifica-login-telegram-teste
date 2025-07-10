@@ -1,0 +1,153 @@
+# Script para configurar agendamento dinamicamente com base no nome do script
+:local scriptName "notifica-login-telegram"
+:local schedulerName ($scriptName . "-scheduler")
+
+# Passo 1: Verificar se o script existe
+:if ([:len [/system script find name=$scriptName]] = 0) do={
+    :log info "Script $scriptName nao encontrado. Criando script..."
+
+    # Criar o script notifica-login-telegram (sem caracteres não-ASCII)
+    /system script
+    add name=$scriptName source={
+:global notificaLoginChave
+:global notificaLoginHistorico
+:local botToken "5973276634:AAE9MdC7S8h5y3Lf_6qzB1EOwAeC8C-GTwQ"
+:local chatId "-1002751530697"
+:local routerName [/system identity get name]
+:local ultimaHora "1970-01-01 00:00:00"
+:local ultimaMensagem ""
+
+# Inicializa notificaLoginChave se nao existir
+:if ([:typeof $notificaLoginChave] != "str") do={
+    :set notificaLoginChave ""
+}
+
+# Extrai ultima mensagem e hora de notificaLoginChave
+:if ([:len $notificaLoginChave] > 0) do={
+    :local underscorePos [:find $notificaLoginChave "_"]
+    :if ($underscorePos > 0) do={
+        :set ultimaMensagem [:pick $notificaLoginChave 0 $underscorePos]
+        :set ultimaHora [:pick $notificaLoginChave ($underscorePos + 1) [:len $notificaLoginChave]]
+    }
+}
+
+# Inicializa notificaLoginHistorico como array se nao for
+:if ([:typeof $notificaLoginHistorico] != "array") do={
+    :set notificaLoginHistorico [:toarray ""]
+}
+
+# Funcao para codificar URL
+:local urlEncode do={
+    :local input $1
+    :local result ""
+    :local hex "0123456789ABCDEF"
+    :for i from=0 to=([:len $input] - 1) do={
+        :local char [:pick $input $i]
+        :if ([:find "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.~" $char] < 0) do={
+            :local byte [:tonum [:tostr [:convert to=hex $char]]]
+            :local high ($byte / 16)
+            :local low ($byte % 16)
+            :set result ($result . "%" . [:pick $hex $high] . [:pick $hex $low])
+        } else={
+            :set result ($result . $char)
+        }
+    }
+    :return $result
+}
+
+# Funcao para comparar datas
+:local compareDates do={
+    :local d1 $1
+    :local d2 $2
+    :if ([:len $d1] != 19 || [:len $d2] != 19) do={ :return false }
+    :local t1 ((([:tonum [:pick $d1 0 4]] * 12 + [:tonum [:pick $d1 5 7]]) * 30 + [:tonum [:pick $d1 8 10]]) * 24 + [:tonum [:pick $d1 11 13]]) * 60 + [:tonum [:pick $d1 14 16]]
+    :set t1 ($t1 * 60 + [:tonum [:pick $d1 17 19]])
+    :local t2 ((([:tonum [:pick $d2 0 4]] * 12 + [:tonum [:pick $d2 5 7]]) * 30 + [:tonum [:pick $d2 8 10]]) * 24 + [:tonum [:pick $d2 11 13]]) * 60 + [:tonum [:pick $d2 14 16]]
+    :set t2 ($t2 * 60 + [:tonum [:pick $d2 17 19]])
+    :return ($t1 > $t2)
+}
+
+# Processa logs de login/logout
+:local logs [/log print as-value where topics~"account"]
+:foreach log in=$logs do={
+    :local msg ($log->"message")
+    :local hora ($log->"time")
+    # Ignora logs com formato de hora invalido
+    :if ([:len $hora] != 8) do={ :continue }
+    :local nowDate [/system clock get date]
+    :local fullDate ($nowDate . " " . $hora)
+    :if ([$compareDates $fullDate $ultimaHora]) do={
+        :local user ""
+        :local ip ""
+        :local via ""
+        :local acao ""
+        :if ([:find $msg "logged in"] > -1) do={
+            :set acao "conectou"
+            :set user [:pick $msg ([:find $msg "user "] + 5) [:find $msg " logged"]]
+            :set ip [:pick $msg ([:find $msg "from "] + 5) [:find $msg " via"]]
+            :set via [:pick $msg ([:find $msg "via "] + 4) [:len $msg]]
+        }
+        :if ([:find $msg "logged out"] > -1) do={
+            :set acao "desconectou"
+            :set user [:pick $msg ([:find $msg "user "] + 5) [:find $msg " logged"]]
+            :set ip [:pick $msg ([:find $msg "from "] + 5) [:find $msg " via"]]
+            :set via [:pick $msg ([:find $msg "via "] + 4) [:len $msg]]
+        }
+        :if ([:len $user] > 0 && [:len $ip] > 0 && [:len $acao] > 0) do={
+            :local logKey ($user . "_" . $ip . "_" . $acao . "_" . $fullDate)
+            :local chaveSimples ($user . "_" . $ip . "_" . $acao)
+            :local isDuplicate false
+            :foreach k in=$notificaLoginHistorico do={
+                :if ($k = $logKey) do={ :set isDuplicate true }
+            }
+            :if (!$isDuplicate) do={
+                :local texto ("[" . $routerName . "] Usuario " . $user . " " . $acao . " de IP " . $ip . " via " . $via . " em " . $fullDate)
+                :local url ("https://api.telegram.org/bot" . $botToken . "/sendMessage?chat_id=" . $chatId . "&text=" . [$urlEncode $texto])
+                /tool fetch url=$url keep-result=no mode=https
+                :log info "Enviado Telegram: $texto"
+                :set ultimaHora $fullDate
+                :set ultimaMensagem $chaveSimples
+                :set notificaLoginChave ($chaveSimples . "_" . $fullDate)
+                :set notificaLoginHistorico ([:toarray $logKey] + $notificaLoginHistorico)
+                # Limita o historico a 10 entradas
+                :if ([:len $notificaLoginHistorico] > 10) do={
+                    :set notificaLoginHistorico [:pick $notificaLoginHistorico 0 10]
+                }
+            }
+        }
+    }
+}
+    } policy=read,write,policy,test
+    :log info "Script $scriptName criado com sucesso."
+} else={
+    :log info "Script $scriptName ja existe."
+    # Garantir permissões do script
+    /system script
+    set [find name=$scriptName] policy=read,write,policy,test
+}
+
+# Passo 2: Verificar se o agendamento existe
+:if ([:len [/system scheduler find on-event~"run $scriptName"]] > 0) do={
+    :log info "Agendamento para $scriptName encontrado."
+    # Remover agendamento existente (opcional, descomente se desejar remover)
+    # /system scheduler remove [find on-event~"run $scriptName"]
+    # :log info "Agendamento para $scriptName removido."
+} else={
+    :log info "Nenhum agendamento encontrado para $scriptName. Criando novo agendamento..."
+}
+
+# Passo 3: Criar novo agendamento
+/system scheduler
+add name=$schedulerName interval=1m on-event=("/system script run " . $scriptName) policy=read,write,policy,test comment=("Monitoramento de logins via Telegram - " . $scriptName) start-date=2025-07-09 start-time=23:30:00
+:log info "Agendamento $schedulerName criado para script $scriptName."
+
+# Passo 4: Garantir conectividade com Telegram
+:if ([:len [/ip firewall filter find comment="Permitir Telegram"]] = 0) do={
+    /ip firewall filter
+    add chain=output action=accept dst-address-type=domain dst-address=api.telegram.org protocol=tcp dst-port=443 comment="Permitir Telegram"
+    :log info "Regra de firewall adicionada para permitir Telegram."
+}
+
+# Passo 5: Testar o script
+/system script run $scriptName
+:log info "Teste de execucao do script $scriptName realizado. Verifique os logs para confirmacao."
